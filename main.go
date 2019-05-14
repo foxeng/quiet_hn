@@ -9,10 +9,36 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/foxeng/quiet_hn/hn"
 )
+
+const timeout = 15 * time.Minute
+
+var memo cache
+
+type item struct {
+	hn.Item
+	Host string
+	rank int
+}
+
+type templateData struct {
+	Stories []item
+	Time    time.Duration
+}
+
+type cacheItem struct {
+	since time.Time
+	it *item
+}
+
+type cache struct {
+	lock sync.RWMutex
+	store map[int]cacheItem
+}
 
 func main() {
 	// parse flags
@@ -30,6 +56,8 @@ func main() {
 }
 
 func handler(numStories int, tpl *template.Template) http.HandlerFunc {
+	// Initialize the cache
+	memo.store = make(map[int]cacheItem)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		var client hn.Client
@@ -60,10 +88,8 @@ func handler(numStories int, tpl *template.Template) http.HandlerFunc {
 				storiesm[it.rank] = it
 			}
 		}
-		// TODO: Close c?
 
 		stories := mapToSlice(storiesm)
-
 		data := templateData{
 			Stories: stories,
 			Time:    time.Now().Sub(start),
@@ -90,6 +116,15 @@ func mapToSlice(m map[int]*item) []item {
 }
 
 func fetchItem(client *hn.Client, rank int, id int, out chan<- *item) {
+	// Check the cache
+	memo.lock.RLock()
+	res, ok := memo.store[id]
+	memo.lock.RUnlock()
+	if ok && time.Since(res.since) < timeout {
+		out <- res.it
+		return
+	}
+
 	hnItem, err := client.GetItem(id)
 	if err != nil {
 		out <- nil
@@ -101,7 +136,14 @@ func fetchItem(client *hn.Client, rank int, id int, out chan<- *item) {
 		return
 	}
 	it.rank = rank
-	out <- &it // TODO: Is this ok or does it need to be allocated with new()?
+
+	// Update the cache
+	// TODO OPT: Duplicate suppression (see 'The Go Programming Language' p. 276)
+	memo.lock.Lock()
+	memo.store[id] = cacheItem{time.Now(), &it}
+	memo.lock.Unlock()
+
+	out <- &it
 }
 
 func isStoryLink(item item) bool {
@@ -115,15 +157,4 @@ func parseHNItem(hnItem hn.Item) item {
 		ret.Host = strings.TrimPrefix(url.Hostname(), "www.")
 	}
 	return ret
-}
-
-type item struct {
-	hn.Item
-	Host string
-	rank int
-}
-
-type templateData struct {
-	Stories []item
-	Time    time.Duration
 }
